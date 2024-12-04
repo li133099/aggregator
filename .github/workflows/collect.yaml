@@ -1,10 +1,11 @@
 name: Collect
 on:
-  # executed once a day at 03:00
+  # executed once a day at 02:00
   schedule:
     - cron: "00 02 * * *"
-    - cron: "00 10 * * *"
-    - cron: "00 17 * * *"
+    - cron: "00 08 * * *"
+    - cron: "00 14 * * *"
+    - cron: "00 20 * * *"
   workflow_dispatch:
 
 concurrency:
