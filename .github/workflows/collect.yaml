@@ -2,12 +2,12 @@ name: Collect
 on:
   # executed once a day at 02:00
   schedule:
-    - cron: "05 02 * * *"
-    - cron: "05 06 * * *"
-    - cron: "05 10 * * *"
-    - cron: "05 14 * * *"
-    - cron: "05 18 * * *"
-    - cron: "05 22 * * *"
+    - cron: "06 02 * * *"
+    - cron: "06 06 * * *"
+    - cron: "06 10 * * *"
+    - cron: "06 14 * * *"
+    - cron: "06 18 * * *"
+    - cron: "06 22 * * *"
   workflow_dispatch:
 
 concurrency:
