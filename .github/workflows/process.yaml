@@ -1,10 +1,10 @@
 name: Process
 on:
   schedule:
-    - cron: "05 03 * * *"
-    - cron: "05 09 * * *"
-    - cron: "05 15 * * *"
-    - cron: "05 21 * * *"
+    - cron: "06 03 * * *"
+    - cron: "06 09 * * *"
+    - cron: "06 15 * * *"
+    - cron: "06 21 * * *"
   workflow_dispatch:
 
 env:
