@@ -3,27 +3,28 @@
 # @Author  : wzdnzd
 # @Time    : 2024-07-12
 
-import html
+import gzip
+import http.client
 import json
 import math
 import os
 import random
 import re
 import socket
+import ssl
 import subprocess
-import sys
 import time
-import urllib
 import urllib.parse
-import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial
+from typing import Optional
 
 import utils
 import yaml
 from executable import which_bin
 from geoip2 import database
+from iplibrary import create_library, get_providers, resolve_egress_ipv4
 from logger import logger
 
 from clash import is_mihomo
@@ -36,6 +37,8 @@ class ProxyInfo:
     name: str = ""
     country: str = ""
     ip_type: str = ""
+    score: Optional[int] = None
+    provider: str = ""
 
 
 @dataclass
@@ -456,252 +459,74 @@ def locate_by_geoip(proxy: dict, reader: database.Reader) -> dict:
             proxy["name"] = country
             proxy["renamed"] = True
         else:
-            logger.warning(f"cannot get geolocation and rename, address: {address}")
+            logger.warning(f"cannot get geolocation and name, address: {address}")
     except Exception as e:
         logger.error(f"query ip geolocation failed, address: {address}, error: {str(e)}")
 
     return proxy
 
 
-# Cache for checked port statuses
-_PORT_STATUS_CACHE = {}
-_AVAILABLE_PORTS = set()
+class PortReservation:
+    """Reserve local TCP ports by binding them without listen/connect."""
 
+    def __init__(self):
+        self._sockets = []
 
-def get_listening_ports() -> set:
-    """Get the set of listening ports in the system, cross-platform compatible"""
-    listening_ports = set()
+    def reserve(self, n: int) -> list[int]:
+        if n <= 0:
+            return []
 
-    try:
-        # Windows system
-        if os.name == "nt":
-            try:
-                # Use 'cp437' encoding to handle Windows command line output
-                output = subprocess.check_output("netstat -an", shell=True).decode("cp437", errors="replace")
-                for line in output.split("\n"):
-                    if "LISTENING" in line:
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            addr_port = parts[1]
-                            if ":" in addr_port:
-                                try:
-                                    port = int(addr_port.split(":")[-1])
-                                    listening_ports.add(port)
-                                except ValueError:
-                                    pass
-            except Exception as e:
-                logger.warning(f"Windows netstat command failed: {str(e)}")
-                return listening_ports
-
-        # macOS system
-        elif sys.platform == "darwin":
-            try:
-                output = subprocess.check_output("lsof -i -P -n | grep LISTEN", shell=True).decode(
-                    "utf-8", errors="replace"
-                )
-                for line in output.split("\n"):
-                    if ":" in line:
-                        try:
-                            port_part = line.split(":")[-1].split(" ")[0]
-                            port = int(port_part)
-                            listening_ports.add(port)
-                        except (ValueError, IndexError):
-                            pass
-            except Exception as e:
-                logger.warning(f"macOS lsof command failed: {str(e)}")
-                return listening_ports
-
-        # Linux and other systems
-        else:
-            # Try using ss command (newer Linux systems)
-            try:
-                output = subprocess.check_output("ss -tuln", shell=True).decode("utf-8", errors="replace")
-                for line in output.split("\n"):
-                    if "LISTEN" in line:
-                        parts = line.split()
-                        for part in parts:
-                            if ":" in part:
-                                try:
-                                    port = int(part.split(":")[-1])
-                                    listening_ports.add(port)
-                                except ValueError:
-                                    pass
-            except Exception as e:
-                logger.warning(f"Linux ss command failed, trying netstat: {str(e)}")
-                # Fall back to netstat command (older Linux systems)
-                try:
-                    output = subprocess.check_output("netstat -tuln", shell=True).decode("utf-8", errors="replace")
-                    for line in output.split("\n"):
-                        if "LISTEN" in line:
-                            parts = line.split()
-                            for part in parts:
-                                if ":" in part:
-                                    try:
-                                        port = int(part.split(":")[-1])
-                                        listening_ports.add(port)
-                                    except ValueError:
-                                        pass
-                except Exception as e:
-                    logger.warning(f"Linux netstat command also failed: {str(e)}")
-                    return listening_ports
-    except Exception as e:
-        logger.warning(f"Failed to get listening ports: {str(e)}")
-
-    return listening_ports
-
-
-def scan_ports_batch(start_port: int, count: int = 100) -> dict:
-    """Batch scan port statuses, return a dictionary of port statuses"""
-    global _PORT_STATUS_CACHE, _AVAILABLE_PORTS
-
-    # Create a list of ports to scan (excluding ports with known status)
-    ports_to_scan = [p for p in range(start_port, start_port + count) if p not in _PORT_STATUS_CACHE]
-
-    if not ports_to_scan:
-        # If all ports are already cached, return cached results directly
-        return {p: _PORT_STATUS_CACHE.get(p, True) for p in range(start_port, start_port + count)}
-
-    # Use a more efficient way to check ports in batch
-    results = {}
-
-    try:
-        # Get the ports that are currently listening in the system
-        listening_ports = get_listening_ports()
-
-        # Update results
-        for port in ports_to_scan:
-            in_use = port in listening_ports
-            results[port] = in_use
-            _PORT_STATUS_CACHE[port] = in_use
-            if not in_use:
-                _AVAILABLE_PORTS.add(port)
-    except Exception as e:
-        logger.warning(f"Batch port scanning failed, falling back to individual port checks: {str(e)}")
-        # If batch checking fails, fall back to individual port checks
-        for port in ports_to_scan:
-            in_use = check_single_port(port)
-            results[port] = in_use
-            _PORT_STATUS_CACHE[port] = in_use
-            if not in_use:
-                _AVAILABLE_PORTS.add(port)
-
-    # Merge cached and newly scanned results
-    return {
-        **{
-            p: _PORT_STATUS_CACHE.get(p, True) for p in range(start_port, start_port + count) if p in _PORT_STATUS_CACHE
-        },
-        **results,
-    }
-
-
-def check_single_port(port: int) -> bool:
-    """Helper function for checking a single port, checks if the port is listening"""
-    try:
-        # Use socket to check TCP port
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.2)
-        result = sock.connect_ex(("127.0.0.1", port))
-        sock.close()
-        if result == 0:
-            return True
-
-        # Also check IPv6
+        ports = []
         try:
-            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            sock.settimeout(0.2)
-            result = sock.connect_ex(("::1", port))
-            sock.close()
-            return result == 0
-        except:
-            pass
+            for _ in range(n):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind(("127.0.0.1", 0))
+                self._sockets.append(sock)
+                ports.append(sock.getsockname()[1])
+            return ports
+        except Exception:
+            self.close()
+            raise
 
-        return False
-    except:
-        # Assume port is not in use when an error occurs
-        return False
-
-
-def is_port_in_use(port: int) -> bool:
-    """Check if a port is in use (using cache)"""
-    global _PORT_STATUS_CACHE, _AVAILABLE_PORTS
-
-    # If port is known to be available, return directly
-    if port in _AVAILABLE_PORTS:
-        return False
-
-    # If port status is already cached, return directly
-    if port in _PORT_STATUS_CACHE:
-        return _PORT_STATUS_CACHE[port]
-
-    # Otherwise check the port and cache the result
-    in_use = check_single_port(port)
-    _PORT_STATUS_CACHE[port] = in_use
-    if not in_use:
-        _AVAILABLE_PORTS.add(port)
-    return in_use
+    def close(self) -> None:
+        sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
-def generate_mihomo_config(proxies: list[dict]) -> tuple[dict, dict]:
+def generate_mihomo_config(proxies: list[dict], listener_ports: list[int], mixed_port: int) -> tuple[dict, dict]:
     """Generate mihomo configuration for the given proxies"""
-    # Base configuration
     config = {
-        "mixed-port": 7890,
+        "mixed-port": mixed_port,
         "allow-lan": True,
         "mode": "global",
         "log-level": "error",
+        "ipv6": False,
+        "tcp-concurrent": True,
         "proxies": proxies,
         "dns": {
             "enable": True,
-            "enhanced-mode": "fake-ip",
-            "fake-ip-range": "198.18.0.1/16",
+            "ipv6": False,
+            "enhanced-mode": "redir-host",
             "default-nameserver": ["114.114.114.114", "223.5.5.5", "8.8.8.8"],
-            "nameserver": ["https://doh.pub/dns-query"],
+            "nameserver": ["114.114.114.114", "8.8.8.8"],
         },
         "listeners": [],
     }
 
-    # Record the port assigned to each proxy
     records = dict()
-
-    # If there are no proxies, return directly
     if not proxies:
         return config, records
 
-    # Pre-scan ports in batch to improve efficiency
-    start_port = 32001
-
-    # Scan enough ports to ensure there are sufficient available ports
-    port_count = len(proxies) * 2
-    port_status = scan_ports_batch(start_port, port_count)
-
-    # Find all available ports
-    available_ports = [p for p, in_use in port_status.items() if not in_use]
-
-    # If available ports are insufficient, scan more ports
-    if len(available_ports) < len(proxies):
-        additional_ports = scan_ports_batch(start_port + port_count, port_count * 2)
-        available_ports.extend([p for p, in_use in additional_ports.items() if not in_use])
-
-    # Assign an available port to each proxy
     for index, proxy in enumerate(proxies):
-        if index < len(available_ports):
-            port = available_ports[index]
-        else:
-            # If available ports are insufficient, use traditional method to find available ports
-            port = start_port + port_count + index
-            max_attempts = 1000
-            attempts = 0
+        if index >= len(listener_ports):
+            logger.warning(f"No reserved port for proxy {proxy['name']}")
+            continue
 
-            while is_port_in_use(port) and attempts < max_attempts:
-                port += 1
-                attempts += 1
-
-            if attempts >= max_attempts:
-                logger.warning(
-                    f"Could not find an available port for proxy {proxy['name']} after {max_attempts} attempts"
-                )
-                continue
-
+        port = listener_ports[index]
         listener = {
             "name": f"http-{index}",
             "type": "http",
@@ -716,6 +541,223 @@ def generate_mihomo_config(proxies: list[dict]) -> tuple[dict, dict]:
     return config, records
 
 
+def _idna_host(host: str) -> str:
+    host = utils.trim(host)
+    if not host:
+        return host
+    try:
+        return host.encode("idna").decode("ascii")
+    except Exception:
+        return host
+
+
+def _origin_headers(url: str, extra: dict = None) -> dict:
+    parsed = urllib.parse.urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    result = {
+        "User-Agent": utils.USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "close",
+        "Referer": f"{base}/" if base else url,
+        "Origin": base if base else url,
+    }
+    if extra and isinstance(extra, dict):
+        for key, value in extra.items():
+            name = utils.trim(str(key))
+            if not name:
+                continue
+            if value is None:
+                result.pop(name, None)
+            else:
+                result[name] = value
+    return result
+
+
+def _proxy_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.options |= ssl.OP_NO_TICKET
+    if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+        ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
+    try:
+        ctx.set_alpn_protocols(["http/1.1"])
+    except Exception:
+        pass
+    return ctx
+
+
+def _recv_until(sock: socket.socket, marker: bytes, limit: int = 65536) -> bytes:
+    buf = bytearray()
+    while marker not in buf:
+        chunk = sock.recv(min(4096, max(1, limit - len(buf))))
+        if not chunk:
+            raise OSError(f"tunnel: incomplete proxy response: {bytes(buf)!r}")
+        buf += chunk
+        if len(buf) > limit:
+            raise OSError("tunnel: proxy response too large")
+    index = buf.find(marker) + len(marker)
+    if index < len(buf):
+        raise OSError("tunnel: unexpected data after CONNECT")
+    return bytes(buf[:index])
+
+
+def _tls_server_hostname(host: str) -> Optional[str]:
+    text = _idna_host(host)
+    if not text:
+        return None
+    try:
+        socket.inet_pton(socket.AF_INET, text)
+        return None
+    except OSError:
+        pass
+    if ":" in text:
+        try:
+            socket.inet_pton(socket.AF_INET6, text.strip("[]"))
+            return None
+        except OSError:
+            pass
+    return text
+
+
+def _open_http_tunnel(sock: socket.socket, host: str, port: int) -> None:
+    host = _idna_host(host)
+    target = f"{host}:{port}"
+    # Do not send Connection/Proxy-Connection: close. Mihomo hijacks after 200;
+    # a close flag makes Windows RST the socket (WinError 10054) at TLS.
+    sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("ascii"))
+    head = _recv_until(sock, b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0].decode("iso-8859-1", "replace")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2:
+        raise OSError(f"tunnel: invalid CONNECT response: {status_line}")
+    try:
+        code = int(parts[1])
+    except ValueError as e:
+        raise OSError(f"tunnel: invalid CONNECT status: {status_line}") from e
+    if code != 200:
+        raise OSError(f"tunnel: CONNECT failed: {status_line}")
+
+
+def _assert_tunnel_open(sock: socket.socket, wait: float = 0.2) -> None:
+    """Fail fast if the CONNECT already died; otherwise wait out mihomo's peek."""
+    previous = sock.gettimeout()
+    sock.settimeout(max(wait, 0.01))
+    try:
+        peeked = sock.recv(1, socket.MSG_PEEK)
+        if not peeked:
+            raise OSError("tunnel: closed before TLS")
+    except (TimeoutError, socket.timeout):
+        return
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+        raise OSError(f"tunnel: closed before TLS ({e})") from e
+    finally:
+        sock.settimeout(previous)
+
+
+def _http_get_on_sock(sock: socket.socket, host: str, path: str, headers: dict) -> tuple[int, str, bytes]:
+    host = _idna_host(host)
+    lines = [f"GET {path} HTTP/1.1", f"Host: {host}"]
+    sent = {"host"}
+    for key, value in (headers or {}).items():
+        name = utils.trim(str(key))
+        if not name or name.lower() in sent or name.lower().startswith("proxy-"):
+            continue
+        lines.append(f"{name}: {value}")
+        sent.add(name.lower())
+    if "connection" not in sent:
+        lines.append("Connection: close")
+
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+    response = http.client.HTTPResponse(sock, method="GET")
+    try:
+        response.begin()
+        return response.status, utils.trim(response.getheader("Location", "")), response.read()
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+def _decode_body(body: bytes) -> str:
+    if not body:
+        return ""
+    if body[:2] == b"\x1f\x8b":
+        try:
+            body = gzip.decompress(body)
+        except Exception:
+            pass
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return body.decode(encoding)
+        except Exception:
+            continue
+    return body.decode("utf-8", "replace")
+
+
+def _request_through_proxy(port: int, url: str, headers: dict, timeout: int, redirects: int = 3) -> tuple[int, bytes]:
+    """
+    Fetch URL via mihomo HTTP inbound.
+
+    http://  → absolute-form GET (plain HTTP proxy).
+    https:// → CONNECT then TLS in Python. Do not send `GET https://...`:
+    mihomo handles that with client.Do + TLS on net.Pipe, which races the
+    outbound dial and comes back as HTTP 502.
+    """
+    parsed = urllib.parse.urlparse(url)
+    scheme = utils.trim(parsed.scheme).lower()
+    host = parsed.hostname
+    if not host or scheme not in ("http", "https"):
+        raise OSError(f"http: unsupported url: {url}")
+
+    dst_port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    wrapped = None
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(timeout)
+        target = sock
+        request_path = url
+        if scheme == "https":
+            _open_http_tunnel(sock, host, dst_port)
+            _assert_tunnel_open(sock)
+            try:
+                wrapped = _proxy_ssl_context().wrap_socket(
+                    sock,
+                    server_hostname=_tls_server_hostname(host),
+                    suppress_ragged_eofs=True,
+                )
+            except OSError as e:
+                raise OSError(f"tls: {e}") from e
+            target = wrapped
+            request_path = path
+        status, location, body = _http_get_on_sock(target, host, request_path, headers)
+    finally:
+        for item in (wrapped, sock):
+            if item is None:
+                continue
+            try:
+                item.close()
+            except Exception:
+                pass
+
+    if status in (301, 302, 303, 307, 308) and redirects > 0 and location:
+        text = urllib.parse.urljoin(url, location)
+        if text.lower().startswith("http"):
+            return _request_through_proxy(port, text, _origin_headers(text, headers), timeout, redirects - 1)
+
+    return status, body
+
+
 def make_proxy_request(
     port: int,
     url: str,
@@ -723,6 +765,7 @@ def make_proxy_request(
     timeout: int = 10,
     headers: dict = None,
     deserialize: bool = True,
+    quiet: bool = False,
 ) -> tuple[bool, dict]:
     """
     Make an HTTP request through a proxy and return the response
@@ -743,55 +786,26 @@ def make_proxy_request(
         logger.warning("No port provided for proxy")
         return False, {}
 
-    def _build_headers(url: str) -> dict:
-        result = urllib.parse.urlparse(url)
-        base = f"{result.scheme}://{result.netloc}" if result.scheme and result.netloc else ""
-
-        headers = {
-            "User-Agent": utils.USER_AGENT,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Connection": "close",
-            "Referer": f"{base}/" if base else url,
-            "Origin": base if base else url,
-        }
-
-        return headers
-
-    # Configure the proxy for the request
-    proxy_url = f"http://127.0.0.1:{port}"
-    proxies_config = {"http": proxy_url, "https": proxy_url}
-
-    # Configure proxy handler
-    proxy_handler = urllib.request.ProxyHandler(proxies_config)
-
-    # Build opener with proxy handler and custom SSL context.
-    # Using explicit Request(headers=...) is more stable than opener.addheaders for proxy HTTPS requests.
-    opener = urllib.request.build_opener(proxy_handler, urllib.request.HTTPSHandler(context=utils.CTX))
-    default_headers = _build_headers(url)
-    if headers and isinstance(headers, dict):
-        default_headers.update({k: v for k, v in headers.items() if k and v is not None})
-
-    # Try to get response with retry and backoff
+    default_headers = _origin_headers(url, headers)
     attempt, success, data = 0, False, None
     while not success and attempt < max(max_retries, 1):
         try:
-            # Random sleep to avoid being blocked by the API (increasing with each retry)
             if attempt > 0:
                 wait_time = min(2**attempt * random.uniform(0.5, 1.5), 6)
                 time.sleep(wait_time)
 
-            # Make request
-            request = urllib.request.Request(url=url, headers=default_headers, method="GET")
-            response = opener.open(request, timeout=timeout)
-            if response.getcode() == 200:
-                content = response.read().decode("utf-8")
-                data = json.loads(content) if deserialize else content
-                success = True
+            status, body = _request_through_proxy(port, url, default_headers, timeout)
+            if status != 200:
+                raise OSError(f"http: status {status}")
+            content = _decode_body(body)
+            data = json.loads(content) if deserialize else content
+            success = True
         except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed to request {url} through proxy port {port}: {str(e)}")
+            message = f"Attempt {attempt+1} failed to request {url} through proxy port {port}: {str(e)}"
+            if quiet or attempt + 1 < max(max_retries, 1):
+                logger.debug(message)
+            else:
+                logger.warning(message)
 
         attempt += 1
 
@@ -799,29 +813,32 @@ def make_proxy_request(
 
 
 def get_ipv4(port: int, max_retries: int = 5) -> str:
-    """
-    Get the IPv4 address by accessing https://api.ipify.org?format=json through a proxy
-
-    Args:
-        port: The port of the proxy
-        max_retries: Maximum number of retry attempts
-
-    Returns:
-        The IPv4 address or empty string if failed
-    """
+    """Get the egress IPv4 address through a proxy listener."""
     if not port:
         logger.warning("No port provided for proxy")
         return ""
 
-    success, data = make_proxy_request(port=port, url="https://api.ipify.org?format=json", max_retries=max_retries)
-    return data.get("ip", "") if success else ""
+    return resolve_egress_ipv4(port, make_proxy_request, max_retries=max_retries, timeout=10)
+
+
+def _wait_listener(port: int, process: subprocess.Popen, timeout: int = 20) -> None:
+    deadline = time.time() + max(timeout, 1)
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"mihomo exited before becoming ready, code={process.returncode}")
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+            sock.close()
+            return
+        except OSError:
+            time.sleep(0.2)
+    raise RuntimeError(f"mihomo listener 127.0.0.1:{port} not ready after {timeout}s")
 
 
 # Online API services for IP location
 LOCATION_API_SERVICES = [
     {"url": "https://ipinfo.io", "country_key": "country"},
     {"url": "https://api.ip2location.io", "country_key": "country_code"},
-    {"url": "https://ipapi.co/json/", "country_key": "country_code"},
     {"url": "https://ipwho.is", "country_key": "country_code"},
     {"url": "https://free.freeipapi.com/api/json", "country_key": "countryCode"},
     {"url": "https://api.ip.sb/geoip", "country_key": "country_code"},
@@ -836,7 +853,14 @@ def random_delay(min_delay: float = 0.01, max_delay: float = 0.5):
     time.sleep(random.uniform(min_delay, max_delay))
 
 
-def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str = "ip2location") -> ProxyQueryResult:
+def check_residential(
+    proxy: dict,
+    port: int,
+    api_key: str = "",
+    ip_library: str = "ipnetcoffee",
+    max_retries: int = 2,
+    timeout: int = 12,
+) -> ProxyQueryResult:
     """
     Check if a proxy is residential by making a request through it
 
@@ -844,134 +868,13 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
         proxy: The proxy information dict
         port: The port of the proxy
         api_key: Optional API key for ipapi.is. Uses free tier if not provided
-        ip_library: IP query provider, supported: ip2location/iplark/ipinfo/ippure/ipapi (default: ip2location)
+        ip_library: IP query provider, supported: ipnetcoffee/meowvps/ippure/ip2location/iplark/ipinfo/ipapi
+        max_retries: Retry count for provider queries
+        timeout: Timeout in seconds for provider queries
 
     Returns:
         ProxyQueryResult: Complete proxy query result
     """
-
-    def _build_url(provider: str, port: int, name: str, api_key: str) -> str:
-        if provider == "ipinfo":
-            # First, get the IP address
-            success, content = make_proxy_request(
-                port=port,
-                url="https://ipinfo.io/ip",
-                max_retries=2,
-                timeout=15,
-                deserialize=False,
-            )
-            if not success or not content:
-                logger.warning(f"Failed to get IP from ipinfo.io for proxy {name}")
-                return ""
-
-            # Extract IP from response
-            ip = utils.trim(content)
-            if not ip:
-                logger.warning(f"Invalid IP address from ipinfo.io for proxy {name}")
-                return ""
-
-            # Now get detailed information using the IP
-            return f"https://ipinfo.io/widget/demo/{ip}"
-        elif provider == "ipapi":
-            url, key = "https://api.ipapi.is", utils.trim(api_key)
-            if key:
-                url += f"?key={key}"
-            return url
-        elif provider == "ippure":
-            return "https://my.ippure.com/v1/info"
-        elif provider == "ip2location":
-            return "https://www.ip2location.com/demo"
-
-        return "https://iplark.com/ipapi/public/ipinfo"
-
-    def _get_providers(preferred: str) -> list[str]:
-        candidates = ["ip2location", "iplark", "ippure", "ipinfo", "ipapi"]
-
-        library = utils.trim(preferred).lower()
-        if library not in candidates:
-            library = "ip2location"
-
-        providers = [library]
-        for item in candidates:
-            if item not in providers:
-                providers.append(item)
-
-        return providers
-
-    def _parse_data(provider: str, response: dict) -> tuple[dict, str, str, str]:
-        data, country_code, company_type, asn_type = {}, "", "", ""
-
-        if provider == "ipinfo":
-            data = response.get("data", {}) if isinstance(response, dict) else {}
-            country_code = data.get("country", "")
-            company_type = data.get("company", {}).get("type", "")
-            asn_type = data.get("asn", {}).get("type", "")
-        elif provider == "ipapi":
-            data = response if isinstance(response, dict) else {}
-            country_code = data.get("location", {}).get("country_code", "")
-            company_type = data.get("company", {}).get("type", "")
-            asn_type = data.get("asn", {}).get("type", "")
-        elif provider == "ippure":
-            data = response if isinstance(response, dict) else {}
-            country_code = data.get("countryCode", "")
-
-            flag = data.get("isResidential", False)
-            if flag:
-                company_type, asn_type = "isp", "isp"
-            else:
-                company_type, asn_type = "hosting", "hosting"
-        elif provider == "ip2location":
-            data = response if isinstance(response, dict) else {}
-            country_code = data.get("country_code", "")
-
-            usage_type = utils.trim(data.get("usage_type", "")).lower()
-            as_usage_type = utils.trim(data.get("as_info", {}).get("as_usage_type", "")).lower()
-
-            check = lambda usage: usage.startswith("isp") or usage == "mob"
-            if check(usage_type) and check(as_usage_type):
-                company_type, asn_type = "isp", "isp"
-            else:
-                company_type, asn_type = "hosting", "hosting"
-        else:
-            data = response if isinstance(response, dict) else {}
-            country_code = data.get("country_code", "")
-
-            node_type = utils.trim(data.get("type", "")).lower()
-            if node_type == "isp":
-                company_type, asn_type = "isp", "isp"
-            elif node_type == "business":
-                company_type, asn_type = "business", "business"
-            else:
-                company_type, asn_type = "hosting", "hosting"
-
-        return data, utils.trim(country_code).upper(), utils.trim(company_type).lower(), utils.trim(asn_type).lower()
-
-    def _extract_ip2location_data(content: str) -> dict:
-        """Extract JSON payload from ip2location demo HTML response."""
-        if not content or not isinstance(content, str):
-            return {}
-
-        pattern = r'<code\b[^>]*class=["\'][^"\']*\blanguage-json\b[^"\']*["\'][^>]*>(.*?)</code>\s*</pre>'
-        groups = re.findall(pattern, content, flags=re.I | re.S)
-        if not groups:
-            return {}
-
-        for group in groups:
-            payload = utils.trim(group)
-            if not payload:
-                continue
-
-            # Some syntax highlighters may inject tags into the JSON block.
-            payload = re.sub(r"<[^>]+>", "", payload, flags=re.I | re.S)
-            payload = html.unescape(payload)
-
-            try:
-                return json.loads(payload)
-            except Exception:
-                continue
-
-        return {}
-
     name = proxy.get("name", "")
     result = ProxyInfo(name=name)
 
@@ -979,75 +882,77 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
         logger.warning(f"No port found for proxy {name}")
         return ProxyQueryResult(proxy=proxy, result=result, success=False)
 
-    # Random delay to avoid being blocked by the API
     random_delay()
 
     try:
-        providers = _get_providers(ip_library)
-        success, response, provider = False, None, ""
+        providers = get_providers(ip_library)
+        classified, provider = None, ""
+        egress_ip = None
+        request = partial(make_proxy_request, quiet=True)
+
+        def _cached_egress_ip() -> str:
+            nonlocal egress_ip
+            if egress_ip is None:
+                egress_ip = resolve_egress_ipv4(
+                    port,
+                    request,
+                    max_retries=max_retries,
+                    timeout=max(timeout, 15),
+                )
+                if not egress_ip:
+                    logger.debug(f"Failed to get egress IP for proxy {name}")
+            return egress_ip
 
         for idx, item in enumerate(providers):
-            url = _build_url(provider=item, port=port, name=name, api_key=api_key)
-            if not url:
+            library = create_library(item, api_key=api_key)
+            ip = _cached_egress_ip() if library.needs_egress_ip else ""
+            if library.needs_egress_ip and not ip:
+                if idx < len(providers) - 1:
+                    fallback = providers[idx + 1]
+                    logger.debug(f"Skip {item} for proxy {name}, no egress IP, trying fallback: {fallback}")
+                else:
+                    logger.debug(f"Skip {item} for proxy {name}, no egress IP")
                 continue
 
-            # Call API for IP information through the proxy
-            deserialize, headers = True, None
-            if item == "ip2location":
-                headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-                deserialize = False
-
-            success, response = make_proxy_request(
-                port=port,
-                url=url,
-                max_retries=2,
-                timeout=12,
-                headers=headers,
-                deserialize=deserialize,
-            )
-
-            if success and item == "ip2location":
-                response = _extract_ip2location_data(response)
-                success = isinstance(response, dict) and bool(response)
-                if not success:
-                    logger.warning(f"Failed to extract JSON payload from ip2location demo HTML for proxy {name}")
-
-            if success:
+            data = library.fetch(port, request, max_retries=max_retries, timeout=timeout, ip=ip)
+            if data:
                 provider = item
-                logger.debug(f"IP infor for proxy {name} successfully retrieved, provider: {provider}")
+                classified = library.classify(data)
+                logger.debug(f"IP info for proxy {name} successfully retrieved, provider: {provider}")
                 break
 
             if idx < len(providers) - 1:
                 fallback = providers[idx + 1]
-                logger.warning(f"Failed to query {url} for proxy {name}, provider={item}, trying fallback: {fallback}")
+                logger.debug(f"Failed to query {item} for proxy {name}, trying fallback: {fallback}")
             else:
-                logger.warning(f"Failed to query {url} for proxy {name}, provider={item}")
+                logger.debug(f"Failed to query {item} for proxy {name}")
 
-        # Parse data from response
-        if success:
+        if classified:
             try:
-                data, country_code, company_type, asn_type = _parse_data(provider, response)
-
+                result.provider = utils.trim(provider)
+                country_code = utils.trim(classified.country_code).upper()
                 if country_code:
                     result.country = ISO_TO_CHINESE.get(country_code, "")
 
                 if not result.country:
+                    raw = classified.raw or {}
                     result.country = utils.trim(
-                        data.get("country_zh", "") or data.get("country", "") or data.get("country_name", "")
+                        raw.get("country_zh", "") or raw.get("country", "") or raw.get("country_name", "")
                     )
 
-                # Check if it's residential (both company and asn type should be "isp")
+                company_type = utils.trim(classified.company_type).lower()
+                asn_type = utils.trim(classified.asn_type).lower()
                 if company_type == "isp" and asn_type == "isp":
                     result.ip_type = "isp"
                 elif company_type in ["business", "isp"] and asn_type in ["business", "isp"]:
                     result.ip_type = "business"
 
+                result.score = classified.score
             except Exception as e:
                 logger.error(f"Error parsing response for proxy {name}: {str(e)}")
         else:
             logger.warning(f"Failed to query residential info for proxy {name} with providers: {providers}")
 
-        # Determine if query was successful
         flag = result.country != "" or result.ip_type != ""
         return ProxyQueryResult(proxy=proxy, result=result, success=flag)
 
@@ -1058,88 +963,52 @@ def check_residential(proxy: dict, port: int, api_key: str = "", ip_library: str
 
 def locate_by_ipinfo(proxy: dict, port: int, reader: database.Reader = None) -> ProxyQueryResult:
     """Check the location of a single proxy by making a request through it"""
+    name = proxy.get("name", "")
 
-    def _create_failed_result(reason: str = "") -> ProxyQueryResult:
-        """Helper to create failed query result"""
-        name = proxy.get("name", "")
+    def _failed(reason: str = "") -> ProxyQueryResult:
         if reason:
             logger.warning(f"Location query failed for proxy {name}: {reason}")
         return ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=name), success=False)
 
-    def _create_success_result(country: str) -> ProxyQueryResult:
-        """Helper to create successful query result"""
-        info = ProxyInfo(name=proxy.get("name", ""))
-        info.country = country
+    def _success(country: str) -> ProxyQueryResult:
+        info = ProxyInfo(name=name, country=country)
         return ProxyQueryResult(proxy=proxy, result=info, success=True)
 
-    def _try_local_mmdb_lookup() -> str:
-        """Attempt to get country from local MMDB database"""
-        if not reader:
-            return ""
+    if not port:
+        return _failed("No port specified")
 
-        ip = get_ipv4(port=port, max_retries=2)
-        if ip:
-            return query_ip_country(ip, reader) or ""
-        return ""
+    random_delay()
 
-    def _try_online_api_services() -> str:
-        """Attempt to get country from online API services with retry logic"""
+    try:
+        if reader:
+            ip = get_ipv4(port=port, max_retries=2)
+            country = query_ip_country(ip, reader) if ip else ""
+            if country:
+                logger.debug(f"Location found via MMDB for proxy {name}: {country}")
+                return _success(country)
+
         retries = 3
-
         for attempt in range(retries):
-            # Select a random service for this attempt
             service = random.choice(LOCATION_API_SERVICES)
-
-            # Make the API request
-            success, data = make_proxy_request(port=port, url=service["url"], max_retries=1, timeout=12)
-
+            success, data = make_proxy_request(port=port, url=service["url"], max_retries=1, timeout=12, quiet=True)
             if success and data:
-                # Parse country code from response
-                key = service["country_key"]
-                code = data.get(key, "")
-
+                code = data.get(service["country_key"], "")
                 if code:
-                    # Convert to Chinese country name
-                    return ISO_TO_CHINESE.get(code, code)
+                    country = ISO_TO_CHINESE.get(code, code)
+                    logger.debug(f"Location found via API for proxy {name}: {country}")
+                    return _success(country)
 
-            # Handle retry delay for failed attempts
             if attempt < retries - 1:
                 delay = min(2**attempt * random.uniform(1, 2), 6)
-                logger.warning(
-                    f"API attempt {attempt+1} failed for proxy {proxy.get('name', '')} "
-                    f"using {service['url']}, retrying in {delay:.2f}s"
+                logger.debug(
+                    f"API attempt {attempt+1} failed for proxy {name} using {service['url']}, retrying in {delay:.2f}s"
                 )
                 time.sleep(delay)
 
-        return ""
-
-    # Validate input parameters
-    if not port:
-        return _create_failed_result("No port specified")
-
-    # Apply rate limiting
-    random_delay()
-
-    # Main location detection logic
-    try:
-        # Strategy 1: Try local MMDB database first (faster and more reliable)
-        country = _try_local_mmdb_lookup()
-        if country:
-            logger.debug(f"Location found via MMDB for proxy {proxy.get('name', '')}: {country}")
-            return _create_success_result(country)
-
-        # Strategy 2: Fall back to online API services
-        country = _try_online_api_services()
-        if country:
-            logger.debug(f"Location found via API for proxy {proxy.get('name', '')}: {country}")
-            return _create_success_result(country)
-
-        # No location detected from any source
-        return _create_failed_result("Unable to determine location from any source")
-
+        return _failed("Unable to determine location from any source")
     except Exception as e:
-        logger.error(f"Unexpected error during location query for {proxy.get('name', '')}: {str(e)}")
-        return _create_failed_result(f"Exception: {str(e)}")
+        logger.error(f"Unexpected error during location query for {name}: {str(e)}")
+        return _failed(f"Exception: {str(e)}")
 
 
 def batch_query(
@@ -1149,8 +1018,6 @@ def batch_query(
     show_progress: bool = True,
     description: str = "Querying",
     digits: int = 2,
-    reader: database.Reader = None,
-    api_key: str = "",
 ) -> list[ProxyQueryResult]:
     """
     Run mihomo to query proxies information using the specified function
@@ -1162,84 +1029,87 @@ def batch_query(
         show_progress: Whether to show progress
         description: Description for progress display
         digits: Number of digits for proxy naming
-        reader: Optional mmdb reader for locate_by_ipinfo
-        api_key: Optional API key for check_residential function
 
     Returns:
         List of ProxyQueryResult with complete information
     """
-    if not proxies or not is_mihomo():
+    if not proxies:
         return []
 
-    # Rename proxies for consistent naming
+    if not is_mihomo():
+        return [
+            ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=proxy.get("name", "")), success=False)
+            for proxy in proxies
+        ]
+
     nodes = rename(proxies, digits, False)
+    failed = [ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=proxy["name"]), success=False) for proxy in nodes]
 
-    logger.info(f"Generate clash listeners configuration for {len(nodes)} proxies")
-    # Generate mihomo configuration
-    config, records = generate_mihomo_config(nodes)
-
-    # Save the configuration to clash/config.yaml in the project directory
     workspace = os.path.join(os.path.abspath(os.path.dirname(os.path.dirname(__file__))), "clash")
-    config_path = os.path.join(workspace, "config.yaml")
-    with open(config_path, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, allow_unicode=True)
-
-    logger.info(f"Mihomo configuration saved to {config_path}")
-
-    # Check if we can find the mihomo binary
     mihomo_bin = os.path.join(workspace, which_bin()[0])
     if not os.path.exists(mihomo_bin) or not os.path.isfile(mihomo_bin):
         logger.error("Mihomo binary not found, skipping proxy check")
-        return [ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=proxy["name"]), success=False) for proxy in nodes]
+        return failed
 
-    # Make the binary executable
     utils.chmod(mihomo_bin)
 
-    # Start mihomo with the configuration
-    logger.info(f"Starting mihomo with configuration {config_path}")
+    logger.info(f"Generate clash listeners configuration for {len(nodes)} proxies")
+    reservation = PortReservation()
     process = None
     try:
-        # Run mihomo in background
+        ports = reservation.reserve(1 + len(nodes))
+        mixed_port, listener_ports = ports[0], ports[1:]
+        config, records = generate_mihomo_config(nodes, listener_ports, mixed_port)
+
+        config_path = os.path.join(workspace, "config.yaml")
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, allow_unicode=True)
+
+        logger.info(f"Mihomo configuration saved to {config_path}")
+        reservation.close()
+
+        logger.info(f"Starting mihomo with configuration {config_path}")
         process = subprocess.Popen(
             [mihomo_bin, "-d", workspace, "-f", config_path],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
 
-        # Wait longer to ensure mihomo is fully started
         logger.info("Waiting for mihomo to start...")
-        time.sleep(8)
+        _wait_listener(mixed_port, process)
+        if listener_ports:
+            _wait_listener(listener_ports[0], process, timeout=10)
 
-        # Create proxy info mapping for task generation
         mappings = {proxy["name"]: proxy for proxy in nodes}
-
-        # Generate tasks for each proxy
-        if reader is not None:
-            # For locate_by_ipinfo which needs reader parameter
-            tasks = [(mappings[name], port, reader) for name, port in records.items() if name in mappings]
-        elif api_key:
-            # For check_residential with API key
-            tasks = [(mappings[name], port, api_key) for name, port in records.items() if name in mappings]
-        else:
-            # For check_residential without API key
-            tasks = [(mappings[name], port) for name, port in records.items() if name in mappings]
-
-        # Check proxies using the specified function
-        results = utils.multi_thread_run(
-            func=func,
-            tasks=tasks,
-            num_threads=num_threads,
-            show_progress=show_progress,
-            description=description,
+        tasks = [(mappings[name], port) for name, port in records.items() if name in mappings]
+        results = (
+            utils.multi_thread_run(
+                func=func,
+                tasks=tasks,
+                num_threads=num_threads,
+                show_progress=show_progress,
+                description=description,
+            )
+            or []
         )
 
-        return results
+        queried, normalized = set(), []
+        for item in results:
+            if not item:
+                continue
+            normalized.append(item)
+            queried.add(item.proxy.get("name"))
 
+        for proxy in nodes:
+            if proxy["name"] not in queried:
+                normalized.append(ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=proxy["name"]), success=False))
+
+        return normalized
     except Exception as e:
         logger.error(f"Error during mihomo check: {str(e)}")
-        return [ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=proxy["name"]), success=False) for proxy in nodes]
+        return failed
     finally:
-        # Always try to kill the mihomo process
+        reservation.close()
         if process:
             try:
                 process.terminate()
@@ -1248,13 +1118,16 @@ def batch_query(
                 pass
 
 
-def process_query_results(results: list[ProxyQueryResult], strategy: str) -> tuple[list[dict], list[dict]]:
+def process_query_results(
+    results: list[ProxyQueryResult], strategy: str, score: bool = False
+) -> tuple[list[dict], list[dict]]:
     """
     Process proxy query results
 
     Args:
         results: List of query results
         strategy: Processing strategy ('residential' or 'location')
+        score: Whether to prefix node names with provider and trust score
 
     Returns:
         tuple: (list of successful proxies, list of failed proxies)
@@ -1262,6 +1135,9 @@ def process_query_results(results: list[ProxyQueryResult], strategy: str) -> tup
     successes, fails = [], []
 
     for item in results:
+        if not item:
+            continue
+
         if item.success and item.result.country:
             # Copy proxy info to avoid modifying original data
             proxy = item.proxy.copy()
@@ -1273,17 +1149,17 @@ def process_query_results(results: list[ProxyQueryResult], strategy: str) -> tup
                     name += "家宽"
                 elif item.result.ip_type == "business":
                     name += "商宽"
-
-                proxy["name"] = name
-                successes.append(proxy)
-            elif strategy == "location":
-                # Location check strategy
-                proxy["name"] = item.result.country
-                successes.append(proxy)
             else:
-                # Unknown strategy, use query result directly
-                proxy["name"] = item.result.country
-                successes.append(proxy)
+                # Location check or unknown strategy
+                name = item.result.country
+
+            if score and item.result.score is not None:
+                source = utils.trim(item.result.provider).upper()
+                if source:
+                    name = f"[{source}|{str(item.result.score).zfill(3)}] {name}"
+
+            proxy["name"] = name
+            successes.append(proxy)
         else:
             # Failed query proxies
             fails.append(item.proxy)
@@ -1301,6 +1177,7 @@ def regularize(
     residential: bool = False,
     ip_library: str = "",
     digits: int = 2,
+    score: bool = False,
 ) -> list[dict]:
     if not proxies or not isinstance(proxies, list):
         return proxies
@@ -1320,16 +1197,15 @@ def regularize(
         # Use mihomo to check for residential proxies
         results = batch_query(
             proxies=proxies,
-            func=partial(check_residential, ip_library=ip_library),
+            func=partial(check_residential, api_key=api_key, ip_library=ip_library),
             num_threads=num_threads,
             show_progress=show_progress,
             description="Checking residential",
             digits=digits,
-            api_key=api_key,
         )
 
         # Process residential check results
-        successes, fails = process_query_results(results, "residential")
+        successes, fails = process_query_results(results, "residential", score=score)
         logger.info(f"Residential check completed: {len(successes)} successful, {len(fails)} failed")
     else:
         fails = proxies
@@ -1375,16 +1251,15 @@ def regularize(
             # Use mihomo to check IP locations
             query_results = batch_query(
                 proxies=unconfirmed,
-                func=locate_by_ipinfo,
+                func=partial(locate_by_ipinfo, reader=reader),
                 num_threads=num_threads,
                 show_progress=show_progress,
                 description="Querying location",
                 digits=digits,
-                reader=reader,
             )
 
             # Process location check results and handle CDN proxies
-            query_successes, query_fails = process_query_results(query_results, "location")
+            query_successes, query_fails = process_query_results(query_results, "location", score=score)
 
             # Add query successes to final results
             successes.extend(query_successes)

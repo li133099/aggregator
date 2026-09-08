@@ -192,7 +192,7 @@ COMMON_SS_SUPPORTED_CIPHERS = [
     "xchacha20-ietf-poly1305",
 ]
 
-# reference: https://github.com/MetaCubeX/sing-shadowsocks2/blob/dev/shadowaead_2022/method.go#L73-L86
+# reference: https://github.com/SagerNet/sing-shadowsocks2/blob/dev/shadowaead_2022/method.go#L72-L86
 MIHOMO_SS_SUPPORTED_CIPHERS_SALT_LEN = {
     "2022-blake3-aes-128-gcm": 16,
     "2022-blake3-aes-256-gcm": 32,
@@ -252,6 +252,25 @@ VLESS_MLKEM_X25519_PLUS_MODES = ("native", "xorpub", "random")
 VLESS_MLKEM_X25519_PLUS_RTTS = ("1rtt", "0rtt")
 VLESS_MLKEM_X25519_PLUS_PADDING_LIMIT = 20
 VLESS_MLKEM_X25519_PLUS_KEY_SIZES = (32, 1184)
+
+# mihomo ParseRange uses strconv.Atoi (64-bit int on our binaries)
+# see: https://github.com/MetaCubeX/mihomo/blob/Alpha/transport/xhttp/config.go
+XHTTP_RANGE_MAX = 2**63 - 1
+XHTTP_RANGE_FIELDS = (
+    "sc-max-each-post-bytes",
+    "sc-min-posts-interval-ms",
+    "x-padding-bytes",
+    "uplink-chunk-size",
+    "session-length",
+)
+XHTTP_RANGE_POSITIVE_MAX = set(["sc-max-each-post-bytes", "sc-min-posts-interval-ms"])
+XHTTP_REUSE_RANGE_FIELDS = (
+    "max-concurrency",
+    "max-connections",
+    "c-max-reuse-times",
+    "h-max-request-times",
+    "h-max-reusable-secs",
+)
 
 # xtls-rprx-direct and xtls-rprx-origin are deprecated and no longer supported
 # XTLS_FLOWS = set(["xtls-rprx-direct", "xtls-rprx-origin", "xtls-rprx-vision"])
@@ -327,6 +346,169 @@ def verify_vless_encryption(encryption: str) -> bool:
     return True
 
 
+def verify_ss_2022_password(cipher: str, password: str) -> bool:
+    # password is ":"-separated standard base64 PSKs; chacha20 rejects EIH (pskList > 1)
+    # see: https://github.com/SagerNet/sing-shadowsocks2/blob/dev/shadowaead_2022/method.go#L72-L86
+    password = utils.trim(password)
+    if not password:
+        return False
+
+    words = password.split(":")
+    if cipher == "2022-blake3-chacha20-poly1305" and len(words) > 1:
+        return False
+
+    key_len = MIHOMO_SS_SUPPORTED_CIPHERS_SALT_LEN.get(cipher)
+    if not key_len:
+        return False
+
+    for word in words:
+        # Go encoding/base64.StdEncoding: standard alphabet and padding required
+        if not word or not re.fullmatch(r"[A-Za-z0-9+/]+=*$", word) or len(word) % 4 != 0:
+            return False
+        try:
+            text = base64.b64decode(word, validate=True)
+        except:
+            return False
+        if len(text) != key_len:
+            return False
+
+    return True
+
+
+def verify_reality_public_key(public_key: str) -> bool:
+    # mihomo uses base64.RawURLEncoding (URL-safe, no padding) and requires 32 bytes
+    # see: https://github.com/MetaCubeX/mihomo/blob/Alpha/adapter/outbound/reality.go
+    public_key = utils.trim(public_key)
+    if not public_key or not re.fullmatch(r"[A-Za-z0-9_-]+", public_key):
+        return False
+
+    try:
+        decoded = base64.urlsafe_b64decode(public_key + "=" * (-len(public_key) % 4))
+    except:
+        return False
+
+    if len(decoded) != 32:
+        return False
+
+    # reject non-canonical encodings that Go RawURLEncoding.DecodeString rejects
+    canonical = base64.urlsafe_b64encode(decoded).decode("utf-8").rstrip("=")
+    return canonical == public_key
+
+
+def parse_xhttp_range_bound(text: str):
+    # one ParseRange token: decimal int or scientific/float that is a whole number
+    text = utils.trim(text)
+    if not text:
+        return None
+
+    if re.fullmatch(r"[0-9]+", text):
+        try:
+            value = int(text)
+        except:
+            return None
+    else:
+        try:
+            number = float(text)
+        except:
+            return None
+        if number != number or number < 0 or number == float("inf"):
+            return None
+        value = int(number)
+        if value != number:
+            return None
+
+    if value < 0 or value > XHTTP_RANGE_MAX:
+        return None
+    return value
+
+
+def normalize_xhttp_range(value):
+    # canonical "123" or "min-max" for mihomo ParseRange; None if invalid
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        if value < 0 or value > XHTTP_RANGE_MAX:
+            return None
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value < 0 or value == float("inf"):
+            return None
+        number = int(value)
+        if number != value or number > XHTTP_RANGE_MAX:
+            return None
+        return str(number)
+
+    text = utils.trim(str(value))
+    if not text:
+        return ""
+
+    bound = parse_xhttp_range_bound(text)
+    if bound is not None:
+        return str(bound)
+
+    # original value is already a range like "16-32" or "1e5-2e5", not a clamp
+    if text.count("-") != 1:
+        return None
+    left, right = text.split("-", 1)
+    min_val, max_val = parse_xhttp_range_bound(left), parse_xhttp_range_bound(right)
+    if min_val is None or max_val is None or max_val < min_val:
+        return None
+    if min_val == max_val:
+        return str(min_val)
+    return f"{min_val}-{max_val}"
+
+
+def apply_xhttp_range_field(container: dict, key: str, min_positive: bool = False, max_positive: bool = False) -> bool:
+    if key not in container:
+        return True
+
+    value = container[key]
+    if value is None or (isinstance(value, str) and not utils.trim(value)):
+        container.pop(key, None)
+        return True
+
+    normalized = normalize_xhttp_range(value)
+    if normalized is None:
+        return False
+    if not normalized:
+        container.pop(key, None)
+        return True
+
+    parts = normalized.split("-")
+    min_val, max_val = int(parts[0]), int(parts[-1])
+    if min_positive and min_val <= 0:
+        return False
+    if max_positive and max_val <= 0:
+        return False
+
+    container[key] = min_val if len(parts) == 1 else normalized
+    return True
+
+
+def verify_xhttp_reuse_settings(settings: dict) -> bool:
+    if type(settings) != dict:
+        return False
+
+    for key in XHTTP_REUSE_RANGE_FIELDS:
+        if not apply_xhttp_range_field(settings, key):
+            return False
+
+    if "h-keep-alive-period" not in settings:
+        return True
+
+    value = settings["h-keep-alive-period"]
+    if value is None or (isinstance(value, str) and not utils.trim(value)):
+        settings.pop("h-keep-alive-period", None)
+        return True
+
+    normalized = normalize_xhttp_range(value)
+    if not normalized or "-" in normalized:
+        return False
+
+    settings["h-keep-alive-period"] = int(normalized)
+    return True
+
+
 def verify(item: dict, mihomo: bool = True) -> bool:
     if not item or type(item) != dict or "type" not in item:
         return False
@@ -377,17 +559,8 @@ def verify(item: dict, mihomo: bool = True) -> bool:
                 return False
 
             if item["cipher"] in MIHOMO_SS_SUPPORTED_CIPHERS_SALT_LEN:
-                # will throw bad key length error
-                # see: https://github.com/MetaCubeX/sing-shadowsocks2/blob/dev/shadowaead_2022/method.go#L59-L108
-                password = str(item.get(authentication, ""))
-                words = password.split(":")
-                for word in words:
-                    try:
-                        text = base64.b64decode(word)
-                        if len(text) != MIHOMO_SS_SUPPORTED_CIPHERS_SALT_LEN.get(item["cipher"]):
-                            return False
-                    except:
-                        return False
+                if not verify_ss_2022_password(item["cipher"], str(item.get(authentication, ""))):
+                    return False
 
             plugin = item.get("plugin", "")
 
@@ -610,10 +783,10 @@ def verify(item: dict, mihomo: bool = True) -> bool:
                         return False
 
                     content = utils.trim(reality_opts["public-key"])
-                    content += "=" * (4 - len(content) % 4)
-                    public_key = base64.urlsafe_b64decode(content)
-                    if len(public_key) != 32:
+                    if not verify_reality_public_key(content):
                         return False
+
+                    reality_opts["public-key"] = content
 
                     short_id = reality_opts["short-id"]
                     if type(short_id) != str:
@@ -649,6 +822,29 @@ def verify(item: dict, mihomo: bool = True) -> bool:
                             return False
                     if "headers" in xhttp_opts and type(xhttp_opts["headers"]) != dict:
                         return False
+
+                    # ParseRange fields must be decimal ints or min-max, not 1E+05 / 100000.0
+                    # see: https://github.com/MetaCubeX/mihomo/blob/Alpha/transport/xhttp/config.go
+                    for key in XHTTP_RANGE_FIELDS:
+                        min_positive = key == "session-length"
+                        max_positive = key in XHTTP_RANGE_POSITIVE_MAX
+                        if not apply_xhttp_range_field(
+                            xhttp_opts, key, min_positive=min_positive, max_positive=max_positive
+                        ):
+                            return False
+
+                    if "reuse-settings" in xhttp_opts and not verify_xhttp_reuse_settings(
+                        xhttp_opts.get("reuse-settings")
+                    ):
+                        return False
+                    if "download-settings" in xhttp_opts:
+                        download_settings = xhttp_opts.get("download-settings")
+                        if type(download_settings) != dict:
+                            return False
+                        if "reuse-settings" in download_settings and not verify_xhttp_reuse_settings(
+                            download_settings.get("reuse-settings")
+                        ):
+                            return False
             elif item["type"] == "tuic":
                 # mihomo: https://wiki.metacubex.one/config/proxies/tuic
                 token = wrap(item.get("token", ""))

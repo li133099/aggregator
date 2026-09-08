@@ -574,7 +574,7 @@ def aggregate(args: argparse.Namespace) -> None:
         filename = "config.yaml"
         proxies = clash.generate_config(workspace, proxies, filename)
 
-        # filer
+        # filter
         skip = utils.trim(os.environ.get("SKIP_ALIVE_CHECK", "false")).lower() in ["true", "1"]
         nochecks, starttime = proxies, time.time()
 
@@ -640,6 +640,7 @@ def aggregate(args: argparse.Namespace) -> None:
             locate = regularize.get("locate", False)
             residential = regularize.get("residential", False)
             ip_library = regularize.get("library", "")
+            score = regularize.get("score", False)
             try:
                 bits = max(1, int(regularize.get("bits", 2)))
             except:
@@ -653,6 +654,7 @@ def aggregate(args: argparse.Namespace) -> None:
                 residential=residential,
                 ip_library=ip_library,
                 digits=bits,
+                score=score,
             )
 
         source_file, data = "config.yaml", {"proxies": nochecks}

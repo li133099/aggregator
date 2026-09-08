@@ -223,7 +223,7 @@ def main(args: argparse.Namespace) -> None:
                             elif country:
                                 name = country
                         else:
-                            print("cannot get geolocation and rename because IP address is faked")
+                            print("cannot get geolocation and name because IP address is faked")
 
                         item["name"] = name
                     except Exception:
