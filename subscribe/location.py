@@ -31,11 +31,18 @@ from clash import is_mihomo
 
 
 @dataclass
-class ProxyInfo:
-    """Proxy query result information"""
+class GeoInfo:
+    """Country and CDN attributes of an IP"""
+
+    country: str = ""
+    is_cdn: bool = False
+
+
+@dataclass
+class ProxyInfo(GeoInfo):
+    """Proxy query result, including geo attributes"""
 
     name: str = ""
-    country: str = ""
     ip_type: str = ""
     score: Optional[int] = None
     provider: str = ""
@@ -303,6 +310,34 @@ ISO_TO_CHINESE = {
 }
 
 
+# Pattern for CDN providers and Loyalsoldier custom ISO codes
+CDN_PATTERN = r"cloudflare|cloudfront|fastly|google"
+_CDN_NAME_RE = re.compile(CDN_PATTERN, flags=re.I)
+
+
+def is_cdn_label(value: str) -> bool:
+    """Return True if a country name or ISO code refers to a CDN instead of a location"""
+    text = utils.trim(value)
+    return bool(text and _CDN_NAME_RE.search(text))
+
+
+def _mark_cdn(proxy: dict) -> None:
+    if isinstance(proxy, dict):
+        proxy["cdn"] = True
+
+
+def _is_cdn_proxy(proxy: dict) -> bool:
+    return isinstance(proxy, dict) and (bool(proxy.get("cdn")) or is_cdn_label(str(proxy.get("name", ""))))
+
+
+def _remove_temp_flags(proxies: list[dict]) -> list[dict]:
+    for proxy in proxies:
+        if isinstance(proxy, dict):
+            proxy.pop("cdn", None)
+            proxy.pop("renamed", None)
+    return proxies
+
+
 def download_mmdb(repo: str, target: str, filepath: str, retry: int = 3) -> bool:
     """
     Download GeoLite2-City.mmdb from github release
@@ -394,6 +429,39 @@ def load_mmdb(
     return database.Reader(filepath)
 
 
+def lookup_ip_geo(ip: str, reader: database.Reader) -> GeoInfo:
+    """
+    Query country information for an IP address using mmdb database
+
+    CDN ranges such as Cloudflare are reported via is_cdn and never as a country
+    """
+    if not ip or not reader:
+        return GeoInfo()
+
+    try:
+        # fake ip
+        if ip.startswith("198.18.0."):
+            logger.warning("cannot get geolocation because IP address is faked")
+            return GeoInfo()
+
+        response = reader.country(ip)
+        names = response.country.names or {}
+        iso_code = utils.trim(response.country.iso_code).upper()
+        country = utils.trim(names.get("zh-CN", ""))
+
+        if not country and iso_code:
+            country = ISO_TO_CHINESE.get(iso_code, iso_code)
+
+        well_known_cdn = ip in ("1.1.1.1", "1.0.0.1") or ip.startswith("8.8.8.") or ip.startswith("8.8.4.")
+        if well_known_cdn or is_cdn_label(iso_code) or is_cdn_label(country):
+            return GeoInfo(is_cdn=True)
+
+        return GeoInfo(country=country)
+    except Exception as e:
+        logger.error(f"query ip country failed, ip: {ip}, error: {str(e)}")
+        return GeoInfo()
+
+
 def query_ip_country(ip: str, reader: database.Reader) -> str:
     """
     Query country information for an IP address using mmdb database
@@ -405,37 +473,7 @@ def query_ip_country(ip: str, reader: database.Reader) -> str:
     Returns:
         The country name in Chinese
     """
-    if not ip or not reader:
-        return ""
-
-    try:
-        # fake ip
-        if ip.startswith("198.18.0."):
-            logger.warning("cannot get geolocation because IP address is faked")
-            return ""
-
-        response = reader.country(ip)
-
-        # Try to get country name in Chinese
-        country = response.country.names.get("zh-CN", "")
-
-        # If Chinese name is not available, try to convert ISO code to Chinese country name
-        if not country and response.country.iso_code:
-            iso_code = response.country.iso_code
-            # Try to get Chinese country name from ISO code mapping
-            country = ISO_TO_CHINESE.get(iso_code, iso_code)
-
-        # Special handling for well-known IPs
-        if not country:
-            if ip == "1.1.1.1" or ip == "1.0.0.1":
-                country = "Cloudflare"
-            elif ip.startswith("8.8.8.") or ip.startswith("8.8.4."):
-                country = "Google"
-
-        return country
-    except Exception as e:
-        logger.error(f"query ip country failed, ip: {ip}, error: {str(e)}")
-        return ""
+    return lookup_ip_geo(ip, reader).country
 
 
 def locate_by_geoip(proxy: dict, reader: database.Reader) -> dict:
@@ -453,10 +491,12 @@ def locate_by_geoip(proxy: dict, reader: database.Reader) -> dict:
             return proxy
 
         ip = socket.gethostbyname(address)
-        country = query_ip_country(ip, reader)
-
-        if country:
-            proxy["name"] = country
+        geo = lookup_ip_geo(ip, reader)
+        if geo.is_cdn:
+            _mark_cdn(proxy)
+            logger.debug(f"server IP belongs to CDN, skip as location, address: {address}")
+        elif geo.country:
+            proxy["name"] = geo.country
             proxy["renamed"] = True
         else:
             logger.warning(f"cannot get geolocation and name, address: {address}")
@@ -844,9 +884,6 @@ LOCATION_API_SERVICES = [
     {"url": "https://api.ip.sb/geoip", "country_key": "country_code"},
 ]
 
-# Pattern for CDN providers
-CDN_PATTERN = r"cloudflare|cloudfront|fastly|google"
-
 
 def random_delay(min_delay: float = 0.01, max_delay: float = 0.5):
     """Random delay to avoid API rate limiting"""
@@ -858,6 +895,7 @@ def check_residential(
     port: int,
     api_key: str = "",
     ip_library: str = "ipnetcoffee",
+    reader: database.Reader = None,
     max_retries: int = 2,
     timeout: int = 12,
 ) -> ProxyQueryResult:
@@ -869,6 +907,7 @@ def check_residential(
         port: The port of the proxy
         api_key: Optional API key for ipapi.is. Uses free tier if not provided
         ip_library: IP query provider, supported: ipnetcoffee/meowvps/ippure/ip2location/iplark/ipinfo/ipapi
+        reader: Optional mmdb reader used to detect CDN egress IPs
         max_retries: Retry count for provider queries
         timeout: Timeout in seconds for provider queries
 
@@ -902,6 +941,14 @@ def check_residential(
                 if not egress_ip:
                     logger.debug(f"Failed to get egress IP for proxy {name}")
             return egress_ip
+
+        if reader:
+            ip = _cached_egress_ip()
+            if ip and lookup_ip_geo(ip, reader).is_cdn:
+                result.is_cdn = True
+                _mark_cdn(proxy)
+                logger.debug(f"Egress IP for proxy {name} belongs to CDN, continue locating")
+                return ProxyQueryResult(proxy=proxy, result=result, success=False)
 
         for idx, item in enumerate(providers):
             library = create_library(item, api_key=api_key)
@@ -953,6 +1000,12 @@ def check_residential(
         else:
             logger.warning(f"Failed to query residential info for proxy {name} with providers: {providers}")
 
+        if is_cdn_label(result.country):
+            result.is_cdn = True
+            _mark_cdn(proxy)
+            logger.debug(f"Residential country for proxy {name} is CDN, continue locating")
+            return ProxyQueryResult(proxy=proxy, result=result, success=False)
+
         flag = result.country != "" or result.ip_type != ""
         return ProxyQueryResult(proxy=proxy, result=result, success=flag)
 
@@ -965,10 +1018,14 @@ def locate_by_ipinfo(proxy: dict, port: int, reader: database.Reader = None) -> 
     """Check the location of a single proxy by making a request through it"""
     name = proxy.get("name", "")
 
+    is_cdn = _is_cdn_proxy(proxy)
+
     def _failed(reason: str = "") -> ProxyQueryResult:
         if reason:
             logger.warning(f"Location query failed for proxy {name}: {reason}")
-        return ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=name), success=False)
+        if is_cdn:
+            _mark_cdn(proxy)
+        return ProxyQueryResult(proxy=proxy, result=ProxyInfo(name=name, is_cdn=is_cdn), success=False)
 
     def _success(country: str) -> ProxyQueryResult:
         info = ProxyInfo(name=name, country=country)
@@ -982,10 +1039,14 @@ def locate_by_ipinfo(proxy: dict, port: int, reader: database.Reader = None) -> 
     try:
         if reader:
             ip = get_ipv4(port=port, max_retries=2)
-            country = query_ip_country(ip, reader) if ip else ""
-            if country:
-                logger.debug(f"Location found via MMDB for proxy {name}: {country}")
-                return _success(country)
+            geo = lookup_ip_geo(ip, reader) if ip else GeoInfo()
+            if geo.is_cdn:
+                is_cdn = True
+                _mark_cdn(proxy)
+                logger.debug(f"Egress IP for proxy {name} belongs to CDN, try online APIs")
+            elif geo.country:
+                logger.debug(f"Location found via MMDB for proxy {name}: {geo.country}")
+                return _success(geo.country)
 
         retries = 3
         for attempt in range(retries):
@@ -995,8 +1056,13 @@ def locate_by_ipinfo(proxy: dict, port: int, reader: database.Reader = None) -> 
                 code = data.get(service["country_key"], "")
                 if code:
                     country = ISO_TO_CHINESE.get(code, code)
-                    logger.debug(f"Location found via API for proxy {name}: {country}")
-                    return _success(country)
+                    if is_cdn_label(code) or is_cdn_label(country):
+                        is_cdn = True
+                        _mark_cdn(proxy)
+                        logger.debug(f"API country for proxy {name} is CDN, continue locating")
+                    else:
+                        logger.debug(f"Location found via API for proxy {name}: {country}")
+                        return _success(country)
 
             if attempt < retries - 1:
                 delay = min(2**attempt * random.uniform(1, 2), 6)
@@ -1138,20 +1204,25 @@ def process_query_results(
         if not item:
             continue
 
-        if item.success and item.result.country:
+        country = utils.trim(item.result.country) if item.result else ""
+        is_cdn = bool(item.result and item.result.is_cdn) or is_cdn_label(country)
+        if is_cdn:
+            _mark_cdn(item.proxy)
+
+        if item.success and country and not is_cdn:
             # Copy proxy info to avoid modifying original data
             proxy = item.proxy.copy()
 
             if strategy == "residential":
                 # Residential IP check strategy
-                name = item.result.country
+                name = country
                 if item.result.ip_type == "isp":
                     name += "家宽"
                 elif item.result.ip_type == "business":
                     name += "商宽"
             else:
                 # Location check or unknown strategy
-                name = item.result.country
+                name = country
 
             if score and item.result.score is not None:
                 source = utils.trim(item.result.provider).upper()
@@ -1184,12 +1255,21 @@ def regularize(
 
     # Phase 1: Residential check if necessary
     successes, fails = [], []
+    reader = None
+
+    if residential:
+        locate = True
+
+    if residential or locate:
+        directory = utils.trim(directory)
+        if not directory:
+            directory = os.path.join(os.path.abspath(os.path.dirname(os.path.dirname(__file__))), "data")
+        reader = load_mmdb(directory=directory, repo="Loyalsoldier/geoip", filename="Country.mmdb", update=update)
+        if not reader:
+            logger.error("cannot load mmdb: Country.mmdb")
 
     if residential:
         logger.info(f"Starting residential check for {len(proxies)} proxies")
-
-        # Enable locate if residential check is enabled
-        locate = True
 
         # Get https://api.ipapi.is API key from environment variable
         api_key = utils.trim(os.environ.get("IPAPI_IS_API_KEY", ""))
@@ -1197,7 +1277,7 @@ def regularize(
         # Use mihomo to check for residential proxies
         results = batch_query(
             proxies=proxies,
-            func=partial(check_residential, api_key=api_key, ip_library=ip_library),
+            func=partial(check_residential, api_key=api_key, ip_library=ip_library, reader=reader),
             num_threads=num_threads,
             show_progress=show_progress,
             description="Checking residential",
@@ -1214,37 +1294,28 @@ def regularize(
     if locate and fails:
         logger.info(f"Starting location check for {len(fails)} proxies")
 
-        # Initialize reader for locate functionality and load mmdb database if available
-        directory = utils.trim(directory)
-        if not directory:
-            directory = os.path.join(os.path.abspath(os.path.dirname(os.path.dirname(__file__))), "data")
-
-        repo, filename = "Loyalsoldier/geoip", "Country.mmdb"
-        reader = load_mmdb(directory=directory, repo=repo, filename=filename, update=update)
-        if not reader:
-            logger.error(f"Skipping location check due to cannot load mmdb: {filename}")
-
         unconfirmed = list()
         if reader:
             # Try local mmdb lookup first
-            tasks = [[p, reader] for p in fails if p and isinstance(p, dict)]
+            sources = [p for p in fails if p and isinstance(p, dict)]
+            tasks = [[p, reader] for p in sources]
             mmdb_results = utils.multi_thread_run(locate_by_geoip, tasks, num_threads, show_progress, "")
 
-            # Separate confirmed and unconfirmed proxies by regex
-            regex = f"中国|{CDN_PATTERN}"
-
-            for proxy in mmdb_results:
-                if proxy.pop("renamed", False) and not re.search(regex, proxy["name"], flags=re.I):
-                    # Add to successes list if confirmed by mmdb lookup
-                    successes.append(proxy)
+            for source, proxy in zip(sources, mmdb_results or []):
+                node = proxy if proxy and isinstance(proxy, dict) else source
+                name = str(node.get("name", ""))
+                cdn = bool(node.get("cdn")) or is_cdn_label(name)
+                if cdn:
+                    _mark_cdn(node)
+                if node.pop("renamed", False) and "中国" not in name and not cdn:
+                    successes.append(node)
                 else:
-                    # Add to unconfirmed list if not confirmed by mmdb lookup
-                    unconfirmed.append(proxy)
+                    unconfirmed.append(node)
         else:
             # No mmdb available, treat all as unconfirmed
             unconfirmed = fails
 
-        # For unconfirmed proxies, use online API services to get location info (fallback)
+        # For unconfirmed proxies, use online API services to get location info
         if unconfirmed:
             logger.info(f"Using online API services for {len(unconfirmed)} unconfirmed proxies")
 
@@ -1264,9 +1335,9 @@ def regularize(
             # Add query successes to final results
             successes.extend(query_successes)
 
-            # Handle CDN proxies that failed location check
+            # CDN nodes without a real country fall back to US
             for proxy in query_fails:
-                if re.search(CDN_PATTERN, proxy["name"], flags=re.I):
+                if _is_cdn_proxy(proxy):
                     logger.warning(f"Failed to get location for proxy {proxy['name']}, assume it's in US")
                     proxy["name"] = "美国"
 
@@ -1278,7 +1349,7 @@ def regularize(
         successes.extend(fails)
 
     # Return final results
-    return rename(proxies=successes, digits=digits, shuffle=True)
+    return rename(proxies=_remove_temp_flags(successes), digits=digits, shuffle=True)
 
 
 def rename(proxies: list[dict], digits: int = 2, shuffle: bool = False) -> list[dict]:

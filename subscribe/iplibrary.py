@@ -94,6 +94,12 @@ def _parse_egress_ipv4(content) -> str:
             if ip:
                 return ip
 
+    # Cloudflare trace lists h=1.1.1.1 before ip=; prefer the ip field
+    for match in re.finditer(r"(?im)^ip=([0-9.]+)\s*$", text):
+        ip = _valid_public_ipv4(match.group(1))
+        if ip:
+            return ip
+
     for match in _IPV4_RE.finditer(text):
         ip = _valid_public_ipv4(match.group(0))
         if ip:
