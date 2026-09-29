@@ -149,9 +149,9 @@
             "emoji": true,
             "list_only": true,
             "targets": {
+                "v2ray": "xxx-v2ray",
                 "clash": "xxx-clash",
-                "singbox": "xxx-singbox",
-                "v2ray": "xxx-v2ray"
+                "singbox": "xxx-singbox"
             },
             "regularize": {
                 "enable": false,
